@@ -1,727 +1,797 @@
-from __future__ import annotations
-import argparse, csv, glob, math, os, random, sys, time
-from dataclasses import dataclass
-from typing import List, Tuple, Optional
-
+import argparse, time, csv, os, random, math
 import numpy as np
-import torch
-import torch.nn as nn
+import torch, torch.nn as nn
+import imageio.v2 as imageio
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+# ------------------------------------------------------------------------------------
+# Env selection
+# ------------------------------------------------------------------------------------
+def _load_env(env_name):
+    assert env_name in ["simple_spread_v3", "simple_tag_v3"]
+    if env_name == "simple_spread_v3":
+        try:
+            from pettingzoo.mpe2 import simple_spread_v3 as simple_spread_v3
+        except Exception:
+            from pettingzoo.mpe import simple_spread_v3 as simple_spread_v3
+        return simple_spread_v3
+    else:
+        try:
+            from pettingzoo.mpe2 import simple_tag_v3 as simple_tag_v3
+        except Exception:
+            from pettingzoo.mpe import simple_tag_v3 as simple_tag_v3
+        return simple_tag_v3
 
-try:
-    from scipy.stats import ttest_ind
-except Exception:
-    ttest_ind = None
-
-
-
-def seed_everything(seed: int):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+# ------------------------------------------------------------------------------------
+# Determinism + init (keep identical across scripts)
+# ------------------------------------------------------------------------------------
+def _seed_everything(seed: int):
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-def pick_device(device: str) -> torch.device:
-    if device == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return torch.device(device)
 
-def process_mem_mb() -> Tuple[float, str]:
-    try:
-        import psutil
-        return psutil.Process().memory_info().rss / (1024**2), "rss"
-    except Exception:
-        try:
-            import resource
-            if sys.platform == "darwin":
-                return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024**2), "ru_maxrss"
-            else:
-                return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0, "ru_maxrss"
-        except Exception:
-            return float("nan"), "n/a"
-
-def read_last_col(csv_path: str, col: str) -> float:
-    with open(csv_path, "r") as f:
-        rows = list(csv.reader(f))
-    if not rows:
-        raise ValueError(f"Empty CSV: {csv_path}")
-    header = rows[0]
-    if col not in header:
-        raise ValueError(f"Column '{col}' not found in {csv_path}. Header: {header}")
-    idx = header.index(col)
-    return float(rows[-1][idx])
-
-def welch_ttest(a: np.ndarray, b: np.ndarray) -> Tuple[float, float]:
-    if ttest_ind is None:
-        return float("nan"), float("nan")
-    t, p = ttest_ind(a, b, equal_var=False)
-    return float(t), float(p)
-
-
-
-CARDS = [0, 1, 2]
-
-def ev_p1_vs(p1: np.ndarray, p2: np.ndarray) -> float:
-    b1, c1 = p1[:3], p1[3:]
-    c2, b2 = p2[:3], p2[3:]
-    ev = 0.0
-    for c1i in CARDS:
-        for c2i in CARDS:
-            if c1i == c2i:
-                continue
-            s4 = 2.0 if c1i > c2i else -2.0
-            s2 = 1.0 if c1i > c2i else -1.0
-            term_B = b1[c1i] * (c2[c2i]*s4 + (1.0-c2[c2i])*1.0)
-            term_C = (1.0-b1[c1i]) * (
-                b2[c2i]*(c1[c1i]*s4 + (1.0-c1[c1i])*(-1.0)) + (1.0-b2[c2i])*s2
-            )
-            ev += term_B + term_C
-    return ev / 6.0
-
-def enumerate_pure_policies_p1():
-    out = []
-    for mask in range(64):
-        b = [(mask >> 0) & 1, (mask >> 1) & 1, (mask >> 2) & 1]
-        c = [(mask >> 3) & 1, (mask >> 4) & 1, (mask >> 5) & 1]
-        out.append(np.array(b + c, dtype=np.float64))
-    return out
-
-def enumerate_pure_policies_p2():
-    out = []
-    for mask in range(64):
-        c = [(mask >> 0) & 1, (mask >> 1) & 1, (mask >> 2) & 1]
-        b = [(mask >> 3) & 1, (mask >> 4) & 1, (mask >> 5) & 1]
-        out.append(np.array(c + b, dtype=np.float64))
-    return out
-
-PURE1 = enumerate_pure_policies_p1()
-PURE2 = enumerate_pure_policies_p2()
-
-
-
-def init_weights(m):
+def _init_weights(m):
     if isinstance(m, nn.Linear):
         nn.init.orthogonal_(m.weight, gain=1.0)
         nn.init.zeros_(m.bias)
 
-class Generator(nn.Module):
-    def __init__(self, zdim: int, hidden: int = 64, out_dim: int = 6):
+def viz_seed(it: int):
+    # Same formula in both scripts
+    return (SEED * 9973 + it * 7919) & 0x7fffffff
+
+# ------------------------------------------------------------------------------------
+# Memory helper
+# ------------------------------------------------------------------------------------
+try:
+    import psutil
+    def _ram_mb():
+        return psutil.Process().memory_info().rss / (1024**2)
+except Exception:
+    try:
+        import resource, sys
+        if sys.platform == "darwin":
+            def _ram_mb():
+                return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024**2)
+        else:
+            def _ram_mb():
+                return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+    except Exception:
+        def _ram_mb():
+            return float("nan")
+
+def _mem_mb():
+    try:
+        return float(_ram_mb()), "rss"
+    except Exception:
+        return float("nan"), "n/a"
+
+# ------------------------------------------------------------------------------------
+# Math helpers (schedule / softmax / scaling)
+# ------------------------------------------------------------------------------------
+def softmax(x: np.ndarray) -> np.ndarray:
+    z = x - x.max()
+    e = np.exp(z)
+    return e / (e.sum() + 1e-12)
+
+
+def eta_t(eta0: float, t: int, sched: str) -> float:
+    if sched == "const":
+        return eta0
+    if sched == "sqrt":
+        return eta0 / max(1.0, math.sqrt(t))
+    if sched == "harmonic":
+        return eta0 / (1.0 + 0.5 * t)
+    return eta0
+
+
+def scale_count(base: int, grow: float, t: int) -> int:
+    # increase with sqrt(t) for variance reduction without huge cost
+    return max(1, int(round(base * (1.0 + grow * math.sqrt(max(1, t))))))
+
+# ------------------------------------------------------------------------------------
+# Stratified (marginal) sampling over each agent's mixed strategy
+# ------------------------------------------------------------------------------------
+def empirical_sigma_rng(rng: np.random.Generator, pvec: np.ndarray, N: int):
+    if N <= 1:
+        return [int(rng.choice(len(pvec), p=pvec))]
+    target = N * pvec
+    base = np.floor(target).astype(int)
+    rem = int(N - base.sum())
+    if rem > 0:
+        frac = target - base
+        order = np.argsort(-frac + 1e-12 * np.arange(len(pvec))[::-1])
+        for k in range(rem):
+            base[order[k]] += 1
+    # deterministically expand to a list with a fixed permutation (by index)
+    seq = []
+    for idx, cnt in enumerate(base.tolist()):
+        seq.extend([idx] * cnt)
+    if len(seq) == 0:
+        seq = [int(rng.choice(len(pvec), p=pvec))]
+    return seq
+
+# ------------------------------------------------------------------------------------
+# Args
+# ------------------------------------------------------------------------------------
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--env", type=str, default="simple_tag_v3",
+                   choices=["simple_spread_v3", "simple_tag_v3"])
+    p.add_argument("--iters", type=int, default=100)
+    p.add_argument("--agents", type=int, default=3,
+                   help="simple_spread: #agents (homogeneous). Ignored for simple_tag.")
+    p.add_argument("--zdim", type=int, default=8)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--max_cycles", type=int, default=100)
+
+    # PPO / policy learning
+    p.add_argument("--rollout_min_steps", type=int, default=1600)
+    p.add_argument("--ppo_epochs", type=int, default=10)
+    p.add_argument("--ppo_batch", type=int, default=1024)
+    p.add_argument("--gamma", type=float, default=0.99)
+    p.add_argument("--gae_lambda", type=float, default=0.95)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--clip", type=float, default=0.2)
+    p.add_argument("--ent_beta", type=float, default=1e-3)
+
+    # Meta update (OMWU) + estimators
+    p.add_argument("--eta", type=float, default=0.35)
+    p.add_argument("--eta_sched", type=str, default="sqrt", choices=["const","sqrt","harmonic"])
+    p.add_argument("--ema", type=float, default=0.0, help="EMA(0..1) for vhat/rbar")
+    p.add_argument("--stratified", type=int, default=1, help="1 = stratified marginal sampling")
+    p.add_argument("--grow", type=float, default=0.0, help="sqrt(t) growth factor for MC budgets")
+    p.add_argument("--mc_ni", type=int, default=8, help="episodes for vhat per iter")
+    p.add_argument("--mc_B", type=int, default=16, help="episodes for rbar per iter")
+
+    # Oracle (population growth)
+    p.add_argument("--pool_mut", type=int, default=2, help="oracle: mutated samples to try")
+    p.add_argument("--pool_rand", type=int, default=1, help="oracle: random samples to try")
+    p.add_argument("--oracle_nz", type=int, default=1, help="oracle: how many z to add per iteration")
+    p.add_argument("--oracle_m", type=int, default=1, help="oracle: eval episodes per candidate")
+
+    # EB–UCB logging
+    p.add_argument("--log_ucb", type=int, default=0, help="1=compute EB–UCB best z per agent (costly)")
+    p.add_argument("--ucb_nz", type=int, default=8)
+    p.add_argument("--delta0", type=float, default=1e-3)
+
+    # I/O + device
+    p.add_argument("--csv", type=str, default="gems_results.csv")
+    p.add_argument("--video", type=str, default="gems_last.gif")  # always GIF
+    p.add_argument("--fps", type=int, default=30)
+    p.add_argument("--device", type=str, default="auto", choices=["auto","cuda","cpu"])
+    p.add_argument("--continuous_actions", action="store_true",
+                   help="Use continuous actions if env supports it")
+
+    # simple_tag knobs
+    p.add_argument("--tag_adversaries", type=int, default=3, help="#taggers (adversaries)")
+    p.add_argument("--tag_runners", type=int, default=1, help="#runners (good agents)")
+    p.add_argument("--tag_obstacles", type=int, default=2, help="#obstacles (explicit; defaults to 2)")
+    return p.parse_args()
+
+args = parse_args()
+
+# Headless robustness
+if "DISPLAY" not in os.environ:
+    os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+
+# Device
+if args.device == "auto":
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+else:
+    dev = args.device
+device = torch.device(dev)
+
+# Seeds
+SEED = args.seed
+_seed_everything(SEED)
+_rng = np.random.default_rng(SEED)
+
+# ------------------------------------------------------------------------------------
+# Env factories (no `.env` unwrap; control render_mode explicitly)
+# ------------------------------------------------------------------------------------
+EnvCls = _load_env(args.env)
+
+def make_env(render=False, mode=None):
+    """
+    For training, pass render=False (render_mode=None).
+    For video, pass render=True and mode='rgb_array'.
+    """
+    render_mode = mode if render else None
+    if args.env == "simple_spread_v3":
+        env = EnvCls.parallel_env(
+            N=args.agents,
+            max_cycles=args.max_cycles,
+            continuous_actions=args.continuous_actions,
+            render_mode=render_mode
+        )
+    else:
+        env = EnvCls.parallel_env(
+            num_good=args.tag_runners,
+            num_adversaries=args.tag_adversaries,
+            num_obstacles=args.tag_obstacles,
+            max_cycles=args.max_cycles,
+            continuous_actions=args.continuous_actions,
+            render_mode=render_mode
+        )
+    return env
+
+# Probe env for shapes/ids
+from gymnasium.spaces import Discrete, Box
+_probe_env = make_env(False, None)
+_init_obs, _ = _probe_env.reset(seed=SEED)
+AGENT_IDS = list(_probe_env.agents)
+_obs_dims = {aid: _probe_env.observation_space(aid).shape[0] for aid in AGENT_IDS}
+_act_spaces = {aid: _probe_env.action_space(aid) for aid in AGENT_IDS}
+_is_all_discrete = all(isinstance(_act_spaces[aid], Discrete) for aid in AGENT_IDS)
+if not _is_all_discrete:
+    assert all(isinstance(_act_spaces[aid], Box) for aid in AGENT_IDS), "Mixed action spaces not supported"
+
+# Team index maps (used if env is simple_tag)
+GOOD_IDX = [i for i,a in enumerate(AGENT_IDS) if a.startswith("agent_")]
+BAD_IDX  = [i for i,a in enumerate(AGENT_IDS) if a.startswith("adversary_")]
+
+N_AGENTS = len(AGENT_IDS)
+ZDIM = args.zdim
+
+# ------------------------------------------------------------------------------------
+# Utils
+# ------------------------------------------------------------------------------------
+def write_video(frames, path, fps):
+    if not frames:
+        return None
+    gif_path = os.path.splitext(path)[0] + ".gif"
+    imageio.mimsave(gif_path, frames, duration=1.0/max(fps,1))
+    return gif_path
+
+# ------------------------------------------------------------------------------------
+# Networks & Agent
+# ------------------------------------------------------------------------------------
+class CategoricalHead(nn.Module):
+    def __init__(self, in_dim, act_dim):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(zdim, hidden), nn.Tanh(),
-            nn.Linear(hidden, hidden), nn.Tanh(),
-            nn.Linear(hidden, out_dim)
+            nn.Linear(in_dim, 64), nn.ReLU(),
+            nn.Linear(64, 32), nn.ReLU(),
+            nn.Linear(32, act_dim)
         )
-        self.apply(init_weights)
+        self.apply(_init_weights)
+    def forward(self, x):
+        return self.net(x)
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        return self.net(z)
+class GaussianHead(nn.Module):
+    def __init__(self, in_dim, act_dim):
+        super().__init__()
+        self.mu = nn.Sequential(
+            nn.Linear(in_dim, 64), nn.ReLU(),
+            nn.Linear(64, act_dim)
+        )
+        self.logstd = nn.Parameter(torch.zeros(act_dim))
+        self.apply(_init_weights)
+    def forward(self, x):
+        mu = self.mu(x)
+        return mu, self.logstd.expand_as(mu)
 
-def sigmoid_probs(logits: torch.Tensor, tau: float, eps: float) -> torch.Tensor:
-    p = torch.sigmoid(logits / max(1e-8, tau))
-    p = torch.nan_to_num(p, nan=0.5)
-    return torch.clamp(p, eps, 1.0 - eps)
+class VNet(nn.Module):
+    def __init__(self, in_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, 64), nn.ReLU(),
+            nn.Linear(64, 32), nn.ReLU(),
+            nn.Linear(32, 1)
+        )
+        self.apply(_init_weights)
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
 
-def bernoulli_kl(p: torch.Tensor, q: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    p = torch.clamp(p, eps, 1.0 - eps)
-    q = torch.clamp(q, eps, 1.0 - eps)
-    return p * torch.log(p / q) + (1.0 - p) * torch.log((1.0 - p) / (1.0 - q))
+class AC(nn.Module):
+    def __init__(self, obs_dim, act_space, zdim):
+        super().__init__()
+        in_dim = obs_dim + zdim
+        self.discrete = isinstance(act_space, Discrete)
+        if self.discrete:
+            self.pi = CategoricalHead(in_dim, act_space.n)
+        else:
+            self.pi = GaussianHead(in_dim, act_space.shape[0])
+        self.v  = VNet(in_dim)
+        self.apply(_init_weights)
+    def forward(self, obs, z):
+        x = torch.cat([obs, z], -1)
+        if self.discrete:
+            logits = self.pi(x)
+            return logits, self.v(x)
+        else:
+            mu, logstd = self.pi(x)
+            return (mu, logstd), self.v(x)
 
-
-
-@dataclass
-class Args:
-    iters: int = 40
-    k0: int = 1
-    kmax: int = 32
-
-    zdim: int = 8
-    tau: float = 1.0
-
-    mc_n: int = 8
-    mc_m: int = 2
-    mc_B: int = 128
-    ema: float = 0.0
-
-    oracle_n: int = 8
-    oracle_m: int = 2
-    cand_mut: int = 32
-    cand_rand: int = 32
-    mut_sigma: float = 0.2
-    delta0: float = 0.5
-
-    eta: float = 0.03
-    eta_sched: str = "const"
-    logit_cap: float = 50.0
-
-    abr_steps: int = 30
-    abr_batch_z: int = 16
-    abr_lr: float = 2e-4
-    beta_kl: float = 0.05
-    q_new_frac: float = 0.25
-    clip_grad: float = 0.5
-
-    eval_every: int = 1
-
-    outdir: str = "results"
-    seeds: str = "0,1,2,3,4"
-    device: str = "auto"
-    no_plots: bool = False
-    ttest_against_glob: Optional[str] = None
-
-
-def parse_args() -> Args:
-    p = argparse.ArgumentParser("GEMS on Kuhn Poker — multi-seed")
-
-    p.add_argument("--iters", type=int, default=40)
-    p.add_argument("--k0", type=int, default=1)
-    p.add_argument("--kmax", type=int, default=32)
-
-    p.add_argument("--zdim", type=int, default=8)
-    p.add_argument("--tau", type=float, default=1.0)
-
-    p.add_argument("--mc_n", type=int, default=8)
-    p.add_argument("--mc_m", type=int, default=2)
-    p.add_argument("--mc_B", type=int, default=128)
-    p.add_argument("--ema", type=float, default=0.0)
-
-    p.add_argument("--oracle_n", type=int, default=8)
-    p.add_argument("--oracle_m", type=int, default=2)
-    p.add_argument("--cand_mut", type=int, default=32)
-    p.add_argument("--cand_rand", type=int, default=32)
-    p.add_argument("--mut_sigma", type=float, default=0.2)
-    p.add_argument("--delta0", type=float, default=0.5)
-
-    p.add_argument("--eta", type=float, default=0.03)
-    p.add_argument("--eta_sched", choices=["const", "sqrt", "harmonic"], default="const")
-    p.add_argument("--logit_cap", type=float, default=50.0)
-
-    p.add_argument("--abr_steps", type=int, default=30)
-    p.add_argument("--abr_batch_z", type=int, default=16)
-    p.add_argument("--abr_lr", type=float, default=2e-4)
-    p.add_argument("--beta_kl", type=float, default=0.05)
-    p.add_argument("--q_new_frac", type=float, default=0.25)
-    p.add_argument("--clip_grad", type=float, default=0.5)
-
-    p.add_argument("--eval_every", type=int, default=1)
-
-    p.add_argument("--outdir", type=str, default="results")
-    p.add_argument("--seeds", type=str, default="0,1,2,3,4")
-    p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
-    p.add_argument("--no_plots", action="store_true")
-    p.add_argument("--ttest_against_glob", type=str, default=None)
-
-    return Args(**vars(p.parse_args()))
-
-
-
-def safe_np_probs(p: np.ndarray) -> np.ndarray:
-    p = np.asarray(p, dtype=np.float64)
-    p = np.nan_to_num(p, nan=0.0, posinf=0.0, neginf=0.0)
-    p = np.clip(p, 0.0, None)
-    s = float(p.sum())
-    if not np.isfinite(s) or s <= 0.0:
-        return np.ones_like(p, dtype=np.float64) / max(1, p.size)
-    p = p / s
-
-    p[-1] = 1.0 - float(p[:-1].sum())
-    if p[-1] < 0.0:
-        p = np.clip(p, 0.0, None)
-        p = p / float(p.sum())
-    return p
-
-
-class GEMSRunner:
-    def __init__(self, args: Args, seed: int, device: torch.device):
-        self.args = args
-        self.seed = seed
-        self.device = device
-
-        seed_everything(seed)
-
-        self.gen = Generator(args.zdim).to(device)
-        self.opt = torch.optim.Adam(self.gen.parameters(), lr=args.abr_lr)
-
-        self.Z1 = torch.randn(args.k0, args.zdim, device=device)
-        self.Z2 = torch.randn(args.k0, args.zdim, device=device)
-
-        self.L1 = torch.zeros(args.k0, dtype=torch.float32, device=device)
-        self.L2 = torch.zeros(args.k0, dtype=torch.float32, device=device)
-        self.prev_g1 = torch.zeros_like(self.L1)
-        self.prev_g2 = torch.zeros_like(self.L2)
-
-        self._VV = None
-        self._RR = None
-
-        self.ev_calls = 0
-
-    def _sigma(self):
-        cap = float(self.args.logit_cap)
-        l1 = torch.clamp(self.L1, -cap, cap)
-        l2 = torch.clamp(self.L2, -cap, cap)
-        return torch.softmax(l1, 0), torch.softmax(l2, 0)
+class Agent:
+    def __init__(self, obs_dim, act_space, zdim):
+        self.discrete = isinstance(act_space, Discrete)
+        self.act_space = act_space
+        self.net = AC(obs_dim, act_space, zdim).to(device)
+        self.opt = torch.optim.Adam(self.net.parameters(), lr=args.lr)
 
     @torch.no_grad()
-    def _policy_probs(self):
-        P1 = sigmoid_probs(self.gen(self.Z1), self.args.tau, 1e-6)
-        P2 = sigmoid_probs(self.gen(self.Z2), self.args.tau, 1e-6)
-        return P1, P2
-
-    def _simulate_episode(self, p1: np.ndarray, p2: np.ndarray) -> float:
-        c = [0, 1, 2]
-        random.shuffle(c)
-        c1, c2 = c[0], c[1]
-        b1 = p1[c1]
-        c2_call = p2[c2]
-        c1_call = p1[3 + c1]
-        b2 = p2[3 + c2]
-
-        if random.random() < b1:
-            if random.random() < c2_call:
-                return 2.0 if c1 > c2 else -2.0
-            return 1.0
-
-        if random.random() < b2:
-            if random.random() < c1_call:
-                return 2.0 if c1 > c2 else -2.0
-            return -1.0
-
-        return 1.0 if c1 > c2 else -1.0
-
-    def mc_estimate_v_r(self):
-        P1_t, P2_t = self._policy_probs()
-        s1, s2 = self._sigma()
-
-        P1 = P1_t.detach().cpu().numpy().astype(np.float64)
-        P2 = P2_t.detach().cpu().numpy().astype(np.float64)
-        s1n = safe_np_probs(s1.detach().cpu().numpy())
-        s2n = safe_np_probs(s2.detach().cpu().numpy())
-
-        K1, K2 = P1.shape[0], P2.shape[0]
-        v1 = np.zeros(K1, dtype=np.float64)
-        v2 = np.zeros(K2, dtype=np.float64)
-        r = np.zeros(1, dtype=np.float64)
-
-        for i in range(K1):
-            acc = 0.0
-            for _ in range(self.args.mc_n):
-                j = int(np.random.choice(K2, p=s2n))
-                for _ in range(self.args.mc_m):
-                    self.ev_calls += 1
-                    acc += self._simulate_episode(P1[i], P2[j])
-            v1[i] = acc / (self.args.mc_n * self.args.mc_m)
-
-        for j in range(K2):
-            acc = 0.0
-            for _ in range(self.args.mc_n):
-                i = int(np.random.choice(K1, p=s1n))
-                for _ in range(self.args.mc_m):
-                    self.ev_calls += 1
-                    acc += self._simulate_episode(P1[i], P2[j])
-            v2[j] = acc / (self.args.mc_n * self.args.mc_m)
-
-        acc = 0.0
-        for _ in range(self.args.mc_B):
-            i = int(np.random.choice(K1, p=s1n))
-            j = int(np.random.choice(K2, p=s2n))
-            self.ev_calls += 1
-            acc += self._simulate_episode(P1[i], P2[j])
-        r[0] = acc / self.args.mc_B
-
-        if self.args.ema > 0.0:
-            beta = float(self.args.ema)
-            if self._VV is None:
-                self._VV = [v1.copy(), v2.copy()]
-                self._RR = r.copy()
-            else:
-                for pidx, vcur in enumerate([v1, v2]):
-                    if self._VV[pidx].shape != vcur.shape:
-                        new = np.zeros_like(vcur)
-                        m = min(self._VV[pidx].shape[0], vcur.shape[0])
-                        new[:m] = self._VV[pidx][:m]
-                        if vcur.shape[0] > m:
-                            new[m:] = vcur[m:]
-                        self._VV[pidx] = new
-
-            self._VV[0] = (1 - beta) * self._VV[0] + beta * v1
-            self._VV[1] = (1 - beta) * self._VV[1] + beta * v2
-            self._RR = (1 - beta) * self._RR + beta * r
-            return [self._VV[0].copy(), self._VV[1].copy()], self._RR.copy()
-
-        return [v1, v2], r
-
-    def _eta(self, t: int) -> float:
-        if self.args.eta_sched == "const":
-            return float(self.args.eta)
-        if self.args.eta_sched == "sqrt":
-            return float(self.args.eta) / max(1.0, math.sqrt(t))
-        if self.args.eta_sched == "harmonic":
-            return float(self.args.eta) / (1.0 + 0.5 * t)
-        return float(self.args.eta)
-
-    def omwu_update(self, t: int, v: List[np.ndarray]):
-        eta = self._eta(t)
-        s1, s2 = self._sigma()
-        g1 = torch.tensor(v[0], dtype=torch.float32, device=self.device)
-        g2 = torch.tensor(-v[1], dtype=torch.float32, device=self.device)
-
-        if self.prev_g1.shape[0] != g1.shape[0]:
-            new = torch.zeros_like(g1)
-            m = min(self.prev_g1.shape[0], g1.shape[0])
-            new[:m] = self.prev_g1[:m]
-            self.prev_g1 = new
-        if self.prev_g2.shape[0] != g2.shape[0]:
-            new = torch.zeros_like(g2)
-            m = min(self.prev_g2.shape[0], g2.shape[0])
-            new[:m] = self.prev_g2[:m]
-            self.prev_g2 = new
-
-        upd1 = 2 * g1 - self.prev_g1
-        upd2 = 2 * g2 - self.prev_g2
-        self.prev_g1 = g1.detach()
-        self.prev_g2 = g2.detach()
-
-        l1 = torch.log(torch.clamp(s1, 1e-12, 1.0))
-        l2 = torch.log(torch.clamp(s2, 1e-12, 1.0))
-        self.L1 = l1 + eta * upd1
-        self.L2 = l2 + eta * upd2
-
-    def abr_tr_train(self):
-        self.gen.train()
-        s1, s2 = self._sigma()
-
-        K1, K2 = self.Z1.shape[0], self.Z2.shape[0]
-        q_new = float(self.args.q_new_frac)
-
-        def sample_anchor_idx(K: int, sigma: torch.Tensor, batch: int):
-            sig = safe_np_probs(sigma.detach().cpu().numpy())
-            if K == 1:
-                return np.zeros(batch, dtype=np.int64)
-            mix = (1 - q_new) * sig
-            mix[-1] += q_new
-            mix = safe_np_probs(mix)
-            return np.random.choice(K, size=batch, p=mix)
-
-        idx1 = sample_anchor_idx(K1, s1, self.args.abr_batch_z)
-        idx2 = sample_anchor_idx(K2, s2, self.args.abr_batch_z)
-
-        with torch.no_grad():
-            prev1 = sigmoid_probs(self.gen(self.Z1[idx1]), self.args.tau, 1e-6)
-            prev2 = sigmoid_probs(self.gen(self.Z2[idx2]), self.args.tau, 1e-6)
-
-        def ev_torch(p1v: torch.Tensor, p2v: torch.Tensor) -> torch.Tensor:
-            b1, c1 = p1v[:3], p1v[3:]
-            c2, b2 = p2v[:3], p2v[3:]
-            ev = torch.zeros([], dtype=torch.float32, device=self.device)
-            for c1i in CARDS:
-                for c2i in CARDS:
-                    if c1i == c2i:
-                        continue
-                    s4 = 2.0 if c1i > c2i else -2.0
-                    s2v = 1.0 if c1i > c2i else -1.0
-                    term_B = b1[c1i] * (c2[c2i]*s4 + (1.0-c2[c2i])*1.0)
-                    term_C = (1.0-b1[c1i]) * (
-                        b2[c2i]*(c1[c1i]*s4 + (1.0-c1[c1i])*(-1.0)) + (1.0-b2[c2i])*s2v
-                    )
-                    ev = ev + term_B + term_C
-            return ev / 6.0
-
-        for _ in range(self.args.abr_steps):
-            p1 = sigmoid_probs(self.gen(self.Z1[idx1]), self.args.tau, 1e-6)
-            p2 = sigmoid_probs(self.gen(self.Z2[idx2]), self.args.tau, 1e-6)
-
-            with torch.no_grad():
-                P1_all = sigmoid_probs(self.gen(self.Z1), self.args.tau, 1e-6)
-                P2_all = sigmoid_probs(self.gen(self.Z2), self.args.tau, 1e-6)
-                mix1 = (s1[:, None] * P1_all).sum(0)
-                mix2 = (s2[:, None] * P2_all).sum(0)
-
-            ev1 = torch.stack([ev_torch(p1[b], mix2) for b in range(p1.shape[0])], 0).mean()
-            ev2 = torch.stack([ev_torch(mix1, p2[b]) for b in range(p2.shape[0])], 0).mean()
-
-            obj = ev1 - ev2
-            loss = -obj
-
-            if self.args.beta_kl > 0.0:
-                kl1 = bernoulli_kl(p1, prev1, eps=1e-6).mean()
-                kl2 = bernoulli_kl(p2, prev2, eps=1e-6).mean()
-                loss = loss + float(self.args.beta_kl) * (kl1 + kl2)
-
-            self.opt.zero_grad(set_to_none=True)
-            loss.backward()
-            if self.args.clip_grad and self.args.clip_grad > 0:
-                torch.nn.utils.clip_grad_norm_(self.gen.parameters(), float(self.args.clip_grad))
-            self.opt.step()
-
-        self.gen.eval()
-
-    def eb_ucb_oracle(self, role: int):
-        P1_t, P2_t = self._policy_probs()
-        s1, s2 = self._sigma()
-
-        P1 = P1_t.detach().cpu().numpy().astype(np.float64)
-        P2 = P2_t.detach().cpu().numpy().astype(np.float64)
-        s1n = safe_np_probs(s1.detach().cpu().numpy())
-        s2n = safe_np_probs(s2.detach().cpu().numpy())
-
-        def eb_width(var: float, n: int, delta: float) -> float:
-            n = max(1, int(n))
-            delta = max(1e-12, float(delta))
-            return math.sqrt(2.0 * var * math.log(3.0 / delta) / n) + 3.0 * math.log(3.0 / delta) / max(1, n - 1)
-
-        if role == 0:
-            Z = self.Z1
-            K = Z.shape[0]
-            mut = Z[torch.randint(0, K, (self.args.cand_mut,), device=self.device)] \
-                  + self.args.mut_sigma * torch.randn(self.args.cand_mut, self.args.zdim, device=self.device)
-            rnd = torch.randn(self.args.cand_rand, self.args.zdim, device=self.device)
-            C = torch.cat([mut, rnd], 0)
-
-            scores = []
-            for zc in C:
-                with torch.no_grad():
-                    pc = sigmoid_probs(self.gen(zc.unsqueeze(0)), self.args.tau, 1e-6)[0].detach().cpu().numpy().astype(np.float64)
-                X = []
-                for _ in range(self.args.oracle_n):
-                    j = int(np.random.choice(P2.shape[0], p=s2n))
-                    for _ in range(self.args.oracle_m):
-                        self.ev_calls += 1
-                        X.append(self._simulate_episode(pc, P2[j]))
-                X = np.array(X, dtype=np.float64)
-                mu = float(X.mean()) if X.size > 0 else 0.0
-                var = float(X.var(ddof=1)) if X.size > 1 else 0.0
-                delta = float(self.args.delta0) / max(2.0, K + 1.0)
-                scores.append(mu + eb_width(var, X.size, delta))
-
-            best = int(np.argmax(np.array(scores)))
-            self.Z1 = torch.cat([self.Z1, C[best].unsqueeze(0)], 0)
-            self.L1 = torch.cat([self.L1, torch.tensor([0.0], device=self.device)], 0)
-            self.prev_g1 = torch.cat([self.prev_g1, torch.tensor([0.0], device=self.device)], 0)
-
+    def act(self, obs_np, z_np):
+        obs = torch.tensor(obs_np, dtype=torch.float32, device=device).unsqueeze(0)
+        z   = torch.tensor(z_np,  dtype=torch.float32, device=device).unsqueeze(0)
+        pi_out, v = self.net(obs, z)
+        if self.discrete:
+            d = torch.distributions.Categorical(logits=pi_out)
+            a = d.sample()
+            return a.item(), d.log_prob(a).squeeze(0), d.entropy().squeeze(0), v.squeeze(0)
         else:
-            Z = self.Z2
-            K = Z.shape[0]
-            mut = Z[torch.randint(0, K, (self.args.cand_mut,), device=self.device)] \
-                  + self.args.mut_sigma * torch.randn(self.args.cand_mut, self.args.zdim, device=self.device)
-            rnd = torch.randn(self.args.cand_rand, self.args.zdim, device=self.device)
-            C = torch.cat([mut, rnd], 0)
+            mu, logstd = pi_out
+            std = logstd.exp()
+            d = torch.distributions.Independent(torch.distributions.Normal(mu, std), 1)
+            a = d.sample()
+            a_np = a.squeeze(0).cpu().numpy()
+            if isinstance(self.act_space, Box):
+                a_np = np.clip(a_np, self.act_space.low, self.act_space.high)
+            return a_np, d.log_prob(a).squeeze(0), d.entropy().squeeze(0), v.squeeze(0)
 
-            scores = []
-            for zc in C:
-                with torch.no_grad():
-                    pc = sigmoid_probs(self.gen(zc.unsqueeze(0)), self.args.tau, 1e-6)[0].detach().cpu().numpy().astype(np.float64)
-                X = []
-                for _ in range(self.args.oracle_n):
-                    i = int(np.random.choice(P1.shape[0], p=s1n))
-                    for _ in range(self.args.oracle_m):
-                        self.ev_calls += 1
-                        X.append(self._simulate_episode(P1[i], pc))
-                X = np.array(X, dtype=np.float64)
-                mu = float(X.mean()) if X.size > 0 else 0.0
-                var = float(X.var(ddof=1)) if X.size > 1 else 0.0
-                delta = float(self.args.delta0) / max(2.0, K + 1.0)
-                scores.append(mu + eb_width(var, X.size, delta))
+    def evaluate(self, obs_t, z_t, act_t):
+        pi_out, v = self.net(obs_t, z_t)
+        if self.discrete:
+            d = torch.distributions.Categorical(logits=pi_out)
+        else:
+            mu, logstd = pi_out
+            std = logstd.exp()
+            d = torch.distributions.Independent(torch.distributions.Normal(mu, std), 1)
+        logp = d.log_prob(act_t)
+        ent = d.entropy()
+        return logp, ent, v
 
-            best = int(np.argmin(np.array(scores)))
-            self.Z2 = torch.cat([self.Z2, C[best].unsqueeze(0)], 0)
-            self.L2 = torch.cat([self.L2, torch.tensor([0.0], device=self.device)], 0)
-            self.prev_g2 = torch.cat([self.prev_g2, torch.tensor([0.0], device=self.device)], 0)
+# ------------------------------------------------------------------------------------
+# GEMS State: population Z and log-weights (for OMWU)
+# ------------------------------------------------------------------------------------
+ENT_BETA = args.ent_beta; GAMMA = args.gamma; LAMBDA = args.gae_lambda
+PPO_EPOCHS, PPO_BATCH = args.ppo_epochs, args.ppo_batch
+MIN_STEPS_PER_ABR = args.rollout_min_steps
+GEMS_ITERS = args.iters
 
-    def nashconv(self) -> Tuple[float, float]:
-        P1_t, P2_t = self._policy_probs()
-        s1, s2 = self._sigma()
+# Per-agent state
+Z = [[] for _ in range(N_AGENTS)]              # Z[p] = list of latent vectors
+LOGS = []                                      # LOGS[p] = np.ndarray of logits for softmax
+G_PREV = []                                     # previous gradient for OMWU
 
-        P1 = P1_t.detach().cpu().numpy().astype(np.float64)
-        P2 = P2_t.detach().cpu().numpy().astype(np.float64)
-        s1n = s1.detach().cpu().numpy().astype(np.float64)
-        s2n = s2.detach().cpu().numpy().astype(np.float64)
 
-        mix1 = (s1n[:, None] * P1).sum(0)
-        mix2 = (s2n[:, None] * P2).sum(0)
+def init_population():
+    for p in range(N_AGENTS):
+        z0 = np.random.normal(0, 1, size=(ZDIM,)).astype(np.float32)
+        Z[p].append(z0)
+    for p in range(N_AGENTS):
+        LOGS.append(np.array([0.0], dtype=np.float64))   # log(1) => uniform over single strat
+        G_PREV.append(np.zeros(1, dtype=np.float64))
 
-        val = ev_p1_vs(mix1, mix2)
-        br1 = max(ev_p1_vs(pi, mix2) for pi in PURE1)
-        br2min = min(ev_p1_vs(mix1, pj) for pj in PURE2)
-        return max(0.0, br1 - br2min), val
+init_population()
+agents = [Agent(_obs_dims[aid], _act_spaces[aid], ZDIM) for aid in AGENT_IDS]
 
-    def step(self, t: int) -> Tuple[float, float, float, float, int, int, str]:
+
+def sigma_list():
+    return [softmax(LOGS[p]) for p in range(N_AGENTS)]
+
+
+def sample_profile_from(sigma_seq, rng):
+    prof = []
+    for p in range(N_AGENTS):
+        probs = sigma_seq[p]
+        idx = int(rng.choice(len(probs), p=probs))
+        prof.append(idx)
+    return prof
+
+
+def stratified_profile_batches(N, rng):
+    """Return N profiles using marginal stratification per agent.
+    For each agent, we pre-allocate N draws according to its sigma, then zip by index.
+    """
+    sig = sigma_list()
+    per_agent_lists = []
+    for p in range(N_AGENTS):
+        per_agent_lists.append(empirical_sigma_rng(rng, sig[p], N))
+    profiles = []
+    for i in range(N):
+        profiles.append([per_agent_lists[p][i % len(per_agent_lists[p])] for p in range(N_AGENTS)])
+    return profiles
+
+# ------------------------------------------------------------------------------------
+# Episodes / Evaluation
+# ------------------------------------------------------------------------------------
+
+def run_episode(prof, z_override=None, render=False, seed=None, record_rgb=False):
+    mode = "rgb_array" if (render or record_rgb) else None
+    env = make_env(render=(render or record_rgb), mode=mode)
+
+    obs, _ = env.reset(seed=seed if seed is not None else random.randint(0, 1<<30))
+    frames = []
+    rets = np.zeros(N_AGENTS, dtype=np.float32)
+    done = False
+
+    if record_rgb:
+        frame = env.render()
+        if frame is not None:
+            frames.append(frame)
+
+    while env.agents and not done:
+        acts = {}
+        for aid in env.agents:
+            p = AGENT_IDS.index(aid)
+            z = z_override[p] if z_override is not None else Z[p][prof[p]]
+            a, _, _, _ = agents[p].act(obs[aid], z)
+            acts[aid] = a
+        obs, r, term, trunc, _ = env.step(acts)
+
+        if record_rgb:
+            frame = env.render()
+            if frame is not None:
+                frames.append(frame)
+
+        for aid, v in r.items():
+            p = AGENT_IDS.index(aid)
+            rets[p] += float(v)
+
+        done = all(term.values()) or all(trunc.values())
+
+    env.close()
+    return rets, frames
+
+
+def record_episode(prof, z_override, seed, path, fps):
+    rets, frames = run_episode(prof, z_override, render=True, seed=seed, record_rgb=True)
+    out = write_video(frames, path, fps)
+    return rets, out
+
+# ------------------------------------------------------------------------------------
+# Meta-estimation with variance cuts (stratified + EMA) and OMWU update
+# ------------------------------------------------------------------------------------
+
+def meta_estimate(it):
+    # Budgets grown with sqrt(t)
+    ni_now = scale_count(args.mc_ni, args.grow, it)
+    B_now  = scale_count(args.mc_B,  args.grow, it)
+
+    # Initialize accumulators
+    vhat = [np.zeros(len(Z[p]), dtype=np.float64) for p in range(N_AGENTS)]
+    vcnt = [np.zeros(len(Z[p]), dtype=np.int64)   for p in range(N_AGENTS)]
+    rbar = np.zeros(N_AGENTS, dtype=np.float64)
+
+    # --- vhat estimates ---
+    if args.stratified:
+        profiles = stratified_profile_batches(ni_now, _rng)
+    else:
+        sig = sigma_list()
+        profiles = [sample_profile_from(sig, _rng) for _ in range(ni_now)]
+
+    for prof in profiles:
+        zr = [Z[p][prof[p]] for p in range(N_AGENTS)]
+        rets, _ = run_episode(prof, zr, render=False)
+        for p in range(N_AGENTS):
+            k = prof[p]
+            vhat[p][k] += rets[p]
+            vcnt[p][k] += 1
+
+    for p in range(N_AGENTS):
+        vcnt_p = np.maximum(1, vcnt[p])
+        vhat[p] = vhat[p] / vcnt_p
+
+    # --- rbar estimates (fresh profiles) ---
+    if args.stratified:
+        profiles_B = stratified_profile_batches(B_now, _rng)
+    else:
+        sig = sigma_list()
+        profiles_B = [sample_profile_from(sig, _rng) for _ in range(B_now)]
+
+    for prof in profiles_B:
+        zr = [Z[p][prof[p]] for p in range(N_AGENTS)]
+        rets, _ = run_episode(prof, zr, render=False)
+        rbar += rets
+    rbar /= max(1, B_now)
+
+    return vhat, rbar
+
+# EMA state
+_VHAT_EMA = None
+_RBAR_EMA = None
+
+
+def ema_blend(vhat, rbar):
+    global _VHAT_EMA, _RBAR_EMA
+    if args.ema <= 0.0:
+        return vhat, rbar
+    if _VHAT_EMA is None:
+        _VHAT_EMA = [v.copy() for v in vhat]
+        _RBAR_EMA = rbar.copy()
+        return vhat, rbar
+    beta = args.ema
+    out_v = []
+    for p in range(N_AGENTS):
+        # Ensure shapes match in case population grew
+        if _VHAT_EMA[p].shape[0] != len(Z[p]):
+            # expand old EMA with last value
+            old = _VHAT_EMA[p]
+            add = len(Z[p]) - old.shape[0]
+            if add > 0:
+                pad = np.full(add, old[-1] if old.size > 0 else 0.0, dtype=np.float64)
+                _VHAT_EMA[p] = np.concatenate([old, pad], axis=0)
+        v = (1 - beta) * _VHAT_EMA[p] + beta * vhat[p]
+        out_v.append(v)
+        _VHAT_EMA[p] = v.copy()
+    _RBAR_EMA = (1 - beta) * _RBAR_EMA + beta * rbar
+    return out_v, _RBAR_EMA.copy()
+
+
+def mwu_update_omwu(vhat, rbar, it):
+    # OMWU: logs += eta_t * (2*grad - g_prev); sigma = softmax(logs)
+    eta_now = eta_t(args.eta, it, args.eta_sched)
+    for p in range(N_AGENTS):
+        # Expand state if new strategies were appended previously
+        if LOGS[p].shape[0] != len(Z[p]):
+            add = len(Z[p]) - LOGS[p].shape[0]
+            if add > 0:
+                # start new logits small (tiny prob)
+                new_logits = np.full(add, LOGS[p].min() - 5.0, dtype=np.float64)
+                LOGS[p] = np.concatenate([LOGS[p], new_logits], axis=0)
+                G_PREV[p] = np.concatenate([G_PREV[p], np.zeros(add, dtype=np.float64)], axis=0)
+
+        gains = np.array(vhat[p], dtype=np.float64) - float(rbar[p])
+        grad_eff = 2.0 * gains - G_PREV[p]
+        LOGS[p] = LOGS[p] + eta_now * grad_eff
+        G_PREV[p] = gains
+
+# ------------------------------------------------------------------------------------
+# Oracle (population growth)
+# ------------------------------------------------------------------------------------
+
+def oracle_select(p, it):
+    base = Z[p][-1]
+    cand = []
+    for _ in range(args.pool_mut):
+        noise = np.random.normal(0, 0.25, size=(ZDIM,)).astype(np.float32)
+        cand.append(base + noise)
+    for _ in range(args.pool_rand):
+        cand.append(np.random.normal(0, 1, size=(ZDIM,)).astype(np.float32))
+
+    scores = []
+    sig = sigma_list()
+    for zc in cand:
+        s_acc = 0.0
+        for _ in range(args.oracle_m):
+            prof = sample_profile_from(sig, _rng)
+            zr = [zc if q == p else Z[q][prof[q]] for q in range(N_AGENTS)]
+            rets, _ = run_episode(prof, zr, render=False)
+            s_acc += rets[p]
+        scores.append(s_acc / max(1, args.oracle_m))
+
+    order = np.argsort(scores)[::-1]
+    add_n = min(args.oracle_nz, len(order))
+    if add_n > 0:
+        for j in range(add_n):
+            Z[p].append(cand[order[j]].copy())
+        # Expand logits with tiny weights
+        add = add_n
+        new_logits = np.full(add, LOGS[p].min() - 5.0, dtype=np.float64)
+        LOGS[p] = np.concatenate([LOGS[p], new_logits], axis=0)
+        G_PREV[p] = np.concatenate([G_PREV[p], np.zeros(add, dtype=np.float64)], axis=0)
+
+# ------------------------------------------------------------------------------------
+# Rollouts + PPO update
+# ------------------------------------------------------------------------------------
+
+def collect_rollouts(p, z_anchor):
+    O, Zs, A, LP, R, ADV = [], [], [], [], [], []
+    steps = 0
+    while steps < MIN_STEPS_PER_ABR:
+        sig = sigma_list()
+        prof = sample_profile_from(sig, _rng)
+        env = make_env(False, None)
+        obs, _ = env.reset(seed=random.randint(0, 1<<30))
+        traj = []
+        done = False
+        while env.agents and not done:
+            acts = {}
+            for aid in env.agents:
+                i = AGENT_IDS.index(aid)
+                z = z_anchor if i == p else Z[i][prof[i]]
+                a, lp, _, v = agents[i].act(obs[aid], z)
+                acts[aid] = a
+                if i == p:
+                    traj.append([obs[aid], z, a, lp.item(), v.item(), 0.0])
+            obs, r, term, trunc, _ = env.step(acts)
+            if traj:
+                traj[-1][5] = float(r[AGENT_IDS[p]])
+            done = all(term.values()) or all(trunc.values())
+        env.close()
+
+        vals = [x[4] for x in traj] + [0.0]
+        rews = [x[5] for x in traj]
+        advs, G = [], 0.0
+        for t in reversed(range(len(rews))):
+            delta = rews[t] + GAMMA * vals[t+1] - vals[t]
+            G = delta + GAMMA * LAMBDA * G
+            advs.append(G)
+        advs = list(reversed(advs))
+        rets = [advs[t] + vals[t] for t in range(len(rews))]
+
+        for (o,z,a,lp,_v,_r), R_t, Adv in zip(traj, rets, advs):
+            O.append(o); Zs.append(z); A.append(a); LP.append(lp); R.append(R_t); ADV.append(Adv)
+        steps += len(traj)
+
+    O = torch.tensor(np.array(O), dtype=torch.float32, device=device)
+    Zs= torch.tensor(np.array(Zs), dtype=torch.float32, device=device)
+    if agents[p].discrete:
+        A = torch.tensor(np.array(A), dtype=torch.long, device=device)
+    else:
+        A = torch.tensor(np.array(A), dtype=torch.float32, device=device)
+    LP= torch.tensor(np.array(LP), dtype=torch.float32, device=device)
+    R = torch.tensor(np.array(R), dtype=torch.float32, device=device)
+    ADV = torch.tensor(np.array(ADV), dtype=torch.float32, device=device)
+    ADV = (ADV - ADV.mean()) / (ADV.std() + 1e-8)
+    return (O, Zs, A, LP, R, ADV)
+
+
+def ppo_update(p, batch):
+    O, Zs, A, LP_old, R_t, ADV = batch
+    N = O.shape[0]
+    idx = np.arange(N)
+    for _ in range(PPO_EPOCHS):
+        np.random.shuffle(idx)
+        for j in range(0, N, PPO_BATCH):
+            jj = idx[j:j+PPO_BATCH]
+            obs_t = O[jj]; z_t = Zs[jj]; act_t = A[jj]
+            logp, ent, val = agents[p].evaluate(obs_t, z_t, act_t)
+            ratio = torch.exp(logp - LP_old[jj])
+            s1 = ratio * ADV[jj]
+            s2 = torch.clamp(ratio, 1.0-args.clip, 1.0+args.clip) * ADV[jj]
+            loss = -torch.min(s1,s2).mean() - ENT_BETA * ent.mean() + 0.5 * (R_t[jj]-val).pow(2).mean()
+            agents[p].opt.zero_grad(set_to_none=True); loss.backward(); agents[p].opt.step()
+
+# ------------------------------------------------------------------------------------
+# EB–UCB logging (optional)
+# ------------------------------------------------------------------------------------
+
+def eb_ucb_best_index_for_agent(p, t):
+    if args.log_ucb == 0:
+        return -1, float("nan")
+    n = max(1, args.ucb_nz)
+    delta_t = max(1e-12, args.delta0 * (t ** -2))
+    sig = sigma_list()
+    best_idx, best_score = -1, -1e18
+    for k in range(len(Z[p])):
+        vals = []
+        for _ in range(n):
+            prof = sample_profile_from(sig, _rng)
+            zr = [Z[q][prof[q]] if q != p else Z[p][k] for q in range(N_AGENTS)]
+            rets, _ = run_episode(prof, zr, render=False)
+            vals.append(float(rets[p]))
+        vals = np.array(vals, dtype=np.float64)
+        mu = float(vals.mean())
+        var = float(vals.var(ddof=1)) if vals.shape[0] > 1 else 0.0
+        ln = math.log(max(1.0000001, 3.0 / delta_t))
+        rad = math.sqrt(2.0 * var * ln / n) + (3.0 * ln / max(1, n - 1))
+        ucb = mu + rad
+        if ucb > best_score:
+            best_score, best_idx = ucb, k
+    return best_idx, best_score
+
+# ------------------------------------------------------------------------------------
+# Training loop with team-aware logging for simple_tag
+# ------------------------------------------------------------------------------------
+
+os.makedirs(os.path.dirname(args.csv) or ".", exist_ok=True)
+os.makedirs(os.path.dirname(args.video) or ".", exist_ok=True)
+
+print(f"[GEMS] env={args.env} agents={len(AGENT_IDS)} device={device.type}" +
+      (f" gpu={torch.cuda.get_device_name(0)}" if device.type=='cuda' else ""))
+
+with open(args.csv, "w", newline="") as f:
+    w = csv.writer(f)
+
+    base_header = [
+        "iter","timestamp","time_sec","mem_mb","mem_type"
+    ] + [f"ret_{i}" for i in range(len(AGENT_IDS))] + [
+        "ret_mean","ret_sum","pop_sizes","video_path"
+    ]
+
+    # Append team-wise stats for tag
+    if args.env == "simple_tag_v3":
+        header = base_header[:-2] + ["good_avg","bad_avg","good_sum","bad_sum"] + base_header[-2:]
+    else:
+        header = base_header
+
+    # Append EB–UCB columns (one per agent) if enabled
+    if args.log_ucb:
+        header = header[:-2] + [f"ucb_best_idx_p{p}" for p in range(N_AGENTS)] + header[-2:]
+
+    w.writerow(header)
+
+    for it in range(1, GEMS_ITERS + 1):
         t0 = time.time()
 
-        v, r = self.mc_estimate_v_r()
+        # Meta estimates + variance cuts
+        vhat, rbar = meta_estimate(it)
+        vhat, rbar = ema_blend(vhat, rbar)
 
-        self.omwu_update(t, v)
+        # OMWU step
+        mwu_update_omwu(vhat, rbar, it)
 
-        self.abr_tr_train()
+        # Oracle expansion
+        for p in range(N_AGENTS):
+            oracle_select(p, it)
 
-        if self.Z1.shape[0] < self.args.kmax:
-            self.eb_ucb_oracle(role=0)
-        if self.Z2.shape[0] < self.args.kmax:
-            self.eb_ucb_oracle(role=1)
+        # PPO on the newest strategy of each agent
+        for p in range(N_AGENTS):
+            batch = collect_rollouts(p, Z[p][-1])
+            ppo_update(p, batch)
 
-        if (t % self.args.eval_every) == 0:
-            nc, val = self.nashconv()
-        else:
-            nc, val = float("nan"), float("nan")
+        # Eval: last strategies
+        prof = [len(Z[p]) - 1 for p in range(N_AGENTS)]
+        s_eval = viz_seed(it)
+        rets, _ = run_episode(prof, [Z[q][prof[q]] for q in range(N_AGENTS)], render=False, seed=s_eval)
 
         dt = time.time() - t0
-        mem_mb, mem_type = process_mem_mb()
-        K1 = int(self.Z1.shape[0])
-        K2 = int(self.Z2.shape[0])
-        mix_ev = float(val)
+        mem, mtype = _mem_mb()
+        overall_mean = float(np.mean(rets))
+        overall_sum  = float(np.sum(rets))
 
-        return dt, float(mem_mb), mix_ev, float(nc), K1, K2, mem_type
+        if args.env == "simple_tag_v3":
+            good_avg = float(np.mean(rets[GOOD_IDX])) if GOOD_IDX else float('nan')
+            bad_avg  = float(np.mean(rets[BAD_IDX]))  if BAD_IDX  else float('nan')
+            good_sum = float(np.sum(rets[GOOD_IDX]))  if GOOD_IDX else float('nan')
+            bad_sum  = float(np.sum(rets[BAD_IDX]))   if BAD_IDX  else float('nan')
 
-
-
-def run_seed(args: Args, seed: int, device: torch.device, per_seed_csv: str) -> Tuple[np.ndarray, str]:
-    runner = GEMSRunner(args, seed=seed, device=device)
-    os.makedirs(os.path.dirname(per_seed_csv) or ".", exist_ok=True)
-
-    hist = np.zeros((args.iters, 6), dtype=np.float64)
-    mem_type_last = "n/a"
-
-    with open(per_seed_csv, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["iter", "dt", "mem_mb", "mix_ev", "nashconv", "n_strats_p1", "n_strats_p2", "mem_type"])
-        for t in range(1, args.iters + 1):
-            dt, mem_mb, mix_ev, nc, k1, k2, mem_type = runner.step(t)
-            mem_type_last = mem_type
-            hist[t - 1] = [dt, mem_mb, mix_ev, nc, k1, k2]
-
-            print(f"[GEMS] seed={seed} iter {t}/{args.iters} | "
-                  f"K1={k1} K2={k2} | NashConv={nc:.6f} mixEV={mix_ev:+.6f} | "
-                  f"{dt:.2f}s mem={mem_mb:.1f}MB")
-
-            w.writerow([t,
-                        f"{dt:.6f}",
-                        f"{mem_mb:.6f}",
-                        f"{mix_ev:+.6f}",
-                        f"{nc:.6f}",
-                        k1, k2,
-                        mem_type])
-            f.flush()
-
-    return hist, mem_type_last
-
-
-def aggregate_and_write(out_csv: str, H: np.ndarray, mem_type: str):
-    os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
-    dt = H[:, :, 0]
-    mem = H[:, :, 1]
-    mix_ev = H[:, :, 2]
-    nc = H[:, :, 3]
-    k1 = H[:, :, 4]
-    k2 = H[:, :, 5]
-
-    def mean_std(x):
-        return x.mean(0), x.std(0, ddof=1) if x.shape[0] > 1 else (x.mean(0), np.zeros_like(x.mean(0)))
-
-    dt_m, dt_s = mean_std(dt)
-    mem_m, mem_s = mean_std(mem)
-    mix_m, mix_s = mean_std(mix_ev)
-    nc_m, nc_s = mean_std(nc)
-    k1_m, k1_s = mean_std(k1)
-    k2_m, k2_s = mean_std(k2)
-
-    T = H.shape[1]
-    with open(out_csv, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["iter",
-                    "dt_mean", "dt_std",
-                    "mem_mb_mean", "mem_mb_std",
-                    "mix_ev_mean", "mix_ev_std",
-                    "nashconv_mean", "nashconv_std",
-                    "n_strats_p1_mean", "n_strats_p1_std",
-                    "n_strats_p2_mean", "n_strats_p2_std",
-                    "mem_type"])
-        for t in range(T):
-            w.writerow([t + 1,
-                        f"{dt_m[t]:.6f}", f"{dt_s[t]:.6f}",
-                        f"{mem_m[t]:.6f}", f"{mem_s[t]:.6f}",
-                        f"{mix_m[t]:+.6f}", f"{mix_s[t]:.6f}",
-                        f"{nc_m[t]:.6f}", f"{nc_s[t]:.6f}",
-                        f"{k1_m[t]:.6f}", f"{k1_s[t]:.6f}",
-                        f"{k2_m[t]:.6f}", f"{k2_s[t]:.6f}",
-                        mem_type
-                        ])
-
-
-def main():
-    args = parse_args()
-    device = pick_device(args.device)
-    seeds = [int(x.strip()) for x in args.seeds.split(",") if x.strip() != ""]
-    os.makedirs(args.outdir, exist_ok=True)
-
-    per_seed_hist = []
-    mem_type = "n/a"
-    seed_csvs = []
-
-    for s in seeds:
-        csv_path = os.path.join(args.outdir, f"gems_seed{s}.csv")
-        seed_csvs.append(csv_path)
-        hist, mtype = run_seed(args, seed=s, device=device, per_seed_csv=csv_path)
-        per_seed_hist.append(hist)
-        mem_type = mtype
-
-    H = np.stack(per_seed_hist, 0)
-    agg_path = os.path.join(args.outdir, "gems_meanstd.csv")
-    aggregate_and_write(agg_path, H, mem_type)
-    print(f"[AGG] wrote: {agg_path}")
-
-    if not args.no_plots:
-        try:
-            import pandas as pd
-            df = pd.read_csv(agg_path)
-            it = df["iter"].values
-            nc_m = df["nashconv_mean"].values
-            nc_s = df["nashconv_std"].values
-            plt.figure()
-            plt.plot(it, nc_m)
-            plt.fill_between(it, nc_m - nc_s, nc_m + nc_s, alpha=0.2)
-            plt.xlabel("Iteration")
-            plt.ylabel("NashConv")
-            plt.title("GEMS on Kuhn Poker (mean ± std over seeds)")
-            plt.tight_layout()
-            nash_png = os.path.join(args.outdir, "gems_nashconv_meanstd.png")
-            plt.savefig(nash_png, dpi=200)
-            plt.close()
-
-            ev_m = df["mix_ev_mean"].values
-            ev_s = df["mix_ev_std"].values
-            plt.figure()
-            plt.plot(it, ev_m)
-            plt.fill_between(it, ev_m - ev_s, ev_m + ev_s, alpha=0.2)
-            plt.xlabel("Iteration")
-            plt.ylabel("Mixture EV (P1)")
-            plt.title("GEMS on Kuhn Poker (mean ± std over seeds)")
-            plt.tight_layout()
-            ev_png = os.path.join(args.outdir, "gems_mixev_meanstd.png")
-            plt.savefig(ev_png, dpi=200)
-            plt.close()
-
-            print(f"[PLOTS] saved: {nash_png}")
-            print(f"[PLOTS] saved: {ev_png}")
-        except Exception as e:
-            print(f"[PLOTS] skipped due to error: {e}")
-
-
-    if args.ttest_against_glob:
-        base_paths = sorted(glob.glob(args.ttest_against_glob))
-        if len(base_paths) == 0:
-            print(f"[TTEST] no baseline files matched glob: {args.ttest_against_glob}")
+            print(f"[GEMS] iter {it}/{GEMS_ITERS} time={dt:.2f}s "
+                  f"good_avg={good_avg:.2f} bad_avg={bad_avg:.2f} "
+                  f"(overall mean={overall_mean:.2f} sum={overall_sum:.2f}) "
+                  f"pop={ [len(Z[p]) for p in range(N_AGENTS)] }")
         else:
-            n = min(len(base_paths), len(seed_csvs))
-            a = np.array([read_last_col(p, "nashconv") for p in seed_csvs[:n]], dtype=np.float64)
-            b = np.array([read_last_col(p, "nashconv") for p in base_paths[:n]], dtype=np.float64)
-            t, pval = welch_ttest(a, b)
-            print(f"[TTEST] Welch t-test (final NashConv): "
-                  f"GEMS mean={a.mean():.4f}±{a.std(ddof=1):.4f} vs baseline mean={b.mean():.4f}±{b.std(ddof=1):.4f} | "
-                  f"t={t:.4f}, p={pval:.4g}")
+            print(f"[GEMS] iter {it}/{GEMS_ITERS} time={dt:.2f}s "
+                  f"mean={overall_mean:.2f} sum={overall_sum:.2f} "
+                  f"pop={ [len(Z[p]) for p in range(N_AGENTS)] }")
 
+        row = [it, time.strftime("%Y-%m-%d %H:%M:%S"), f"{dt:.3f}", f"{mem:.2f}", mtype] + \
+              [f"{r:.3f}" for r in rets.tolist()] + \
+              [f"{overall_mean:.3f}", f"{overall_sum:.3f}", str([len(Z[p]) for p in range(N_AGENTS)]), ""]
 
-if __name__ == "__main__":
-    main()
+        if args.env == "simple_tag_v3":
+            row = row[:-2] + [f"{good_avg:.3f}", f"{bad_avg:.3f}", f"{good_sum:.3f}", f"{bad_sum:.3f}"] + row[-2:]
+
+        if args.log_ucb:
+            ucb_cols = []
+            for p in range(N_AGENTS):
+                idx, score = eb_ucb_best_index_for_agent(p, it)
+                ucb_cols.append(str(idx))
+            row = row[:-2] + ucb_cols + row[-2:]
+
+        w.writerow(row); f.flush()
+
+    # Record last policies with standardized seed
+    print("[GEMS] recording last iteration...")
+    seed_for_record = viz_seed(GEMS_ITERS)
+    prof = [len(Z[p]) - 1 for p in range(N_AGENTS)]
+    zov = [Z[q][prof[q]] for q in range(N_AGENTS)]
+    rets, vpath = record_episode(prof, zov, seed_for_record, args.video, args.fps)
+    with open(args.csv, "a", newline="") as f2:
+        w2 = csv.writer(f2)
+        mem, mtype = _mem_mb()
+        overall_mean = float(np.mean(rets))
+        overall_sum  = float(np.sum(rets))
+        if args.env == "simple_tag_v3":
+            good_avg = float(np.mean(rets[GOOD_IDX])) if GOOD_IDX else float('nan')
+            bad_avg  = float(np.mean(rets[BAD_IDX]))  if BAD_IDX  else float('nan')
+            good_sum = float(np.sum(rets[GOOD_IDX]))  if GOOD_IDX else float('nan')
+            bad_sum  = float(np.sum(rets[BAD_IDX]))   if BAD_IDX  else float('nan')
+            row = [GEMS_ITERS, time.strftime("%Y-%m-%d %H:%M:%S"),
+                   f"0.000", f"{mem:.2f}", mtype] + \
+                  [f"{r:.3f}" for r in rets.tolist()] + \
+                  [f"{overall_mean:.3f}", f"{overall_sum:.3f}",
+                   f"{good_avg:.3f}", f"{bad_avg:.3f}", f"{good_sum:.3f}", f"{bad_sum:.3f}",
+                   str([len(Z[p]) for p in range(N_AGENTS)]), vpath or ""]
+        else:
+            row = [GEMS_ITERS, time.strftime("%Y-%m-%d %H:%M:%S"),
+                   f"0.000", f"{mem:.2f}", mtype] + \
+                  [f"{r:.3f}" for r in rets.tolist()] + \
+                  [f"{overall_mean:.3f}", f"{overall_sum:.3f}",
+                   str([len(Z[p]) for p in range(N_AGENTS)]), vpath or ""]
+        w2.writerow(row)
+    print(f"[GEMS] saved video at: {vpath}")
+
+print("done")
